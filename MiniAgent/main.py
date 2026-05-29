@@ -1,4 +1,6 @@
+import ast
 import json
+import operator
 import os
 from pathlib import Path
 from typing import Any
@@ -25,6 +27,75 @@ SYSTEM_PROMPT = "你是一个耐心、清晰的中文 AI Agent 学习助手。"
 # history.json 仍然完整保存全部历史，但真正发给模型的只取最近部分
 MAX_CONTEXT_MESSAGES = 10
 
+# 允许 calculator 使用的二元运算符
+# 这里不用 eval，而是手动限制可以执行的运算类型，避免执行危险代码
+ALLOWED_BINARY_OPERATORS = {
+    ast.Add: operator.add,       # +
+    ast.Sub: operator.sub,       # -
+    ast.Mult: operator.mul,      # *
+    ast.Div: operator.truediv,   # /
+    ast.Mod: operator.mod,       # %
+    ast.Pow: operator.pow,       # **
+}
+
+# 允许 calculator 使用的一元运算符
+ALLOWED_UNARY_OPERATORS = {
+    ast.UAdd: operator.pos,      # +x
+    ast.USub: operator.neg,      # -x
+}
+
+def safe_calculate(expression: str) -> int | float:
+    """安全地计算一个基础数学表达式。"""
+
+    def evaluate_node(node: ast.AST) -> int | float:
+        """递归计算 AST 节点。"""
+
+        # 表达式根节点
+        if isinstance(node, ast.Expression):
+            return evaluate_node(node.body)
+
+        # 数字节点，例如 1、3.14
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return node.value
+
+        # 二元运算节点，例如 1 + 2、3 * 4
+        if isinstance(node, ast.BinOp):
+            operator_type = type(node.op)
+
+            if operator_type not in ALLOWED_BINARY_OPERATORS:
+                raise ValueError("不支持的二元运算符。")
+
+            left_value = evaluate_node(node.left)
+            right_value = evaluate_node(node.right)
+
+            return ALLOWED_BINARY_OPERATORS[operator_type](left_value, right_value)
+
+        # 一元运算节点，例如 -3、+5
+        if isinstance(node, ast.UnaryOp):
+            operator_type = type(node.op)
+
+            if operator_type not in ALLOWED_UNARY_OPERATORS:
+                raise ValueError("不支持的一元运算符。")
+
+            value = evaluate_node(node.operand)
+
+            return ALLOWED_UNARY_OPERATORS[operator_type](value)
+
+        # 其他所有语法都不允许
+        raise ValueError("表达式中包含不允许的内容。")
+
+    # 把字符串表达式解析为 AST
+    parsed_expression = ast.parse(expression, mode="eval")
+
+    # 递归计算 AST
+    return evaluate_node(parsed_expression)
+
+def calculator_tool(expression: str) -> str:
+    """calculator 工具：计算数学表达式，并返回字符串结果。"""
+
+    result = safe_calculate(expression)
+
+    return str(result)
 
 def load_config() -> dict:
     """从 .env 文件中读取 LLM 配置。"""
@@ -211,6 +282,171 @@ def ask_llm_json(client: OpenAI, model: str, user_input: str) -> dict[str, Any]:
     # 把 JSON 字符串解析成 Python 字典
     return json.loads(content)
 
+def ask_tool_decision(
+    client: OpenAI,
+    model: str,
+    history: list[dict],
+    user_input: str,
+) -> dict[str, Any]:
+    """让模型判断当前用户输入是否需要调用工具。"""
+
+    # 只带最近历史，避免完整 history 干扰工具判断
+    recent_history = history[-MAX_CONTEXT_MESSAGES:]
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "你是一个工具调用决策器。"
+                "你的任务是判断用户问题是否需要调用工具。"
+                "当前可用工具只有一个：calculator。"
+                "calculator 用于计算基础数学表达式，例如 23 * 45、(12 + 8) / 4。"
+                "你必须只输出合法 JSON，不要输出 Markdown，不要输出解释。"
+                "JSON 必须包含字段：need_tool、tool_name、arguments、reason。"
+            ),
+        }
+    ]
+
+    # 加入最近历史，让模型在必要时知道前文
+    messages.extend(recent_history)
+
+    messages.append(
+        {
+            "role": "user",
+            "content": (
+                "请判断下面这个用户输入是否需要调用工具。\n\n"
+                f"用户输入：{user_input}\n\n"
+                "如果需要计算，请输出：\n"
+                "{\n"
+                '  "need_tool": true,\n'
+                '  "tool_name": "calculator",\n'
+                '  "arguments": {"expression": "数学表达式"},\n'
+                '  "reason": "为什么需要调用工具"\n'
+                "}\n\n"
+                "如果不需要工具，请输出：\n"
+                "{\n"
+                '  "need_tool": false,\n'
+                '  "tool_name": null,\n'
+                '  "arguments": {},\n'
+                '  "reason": "为什么不需要调用工具"\n'
+                "}"
+            ),
+        }
+    )
+
+    response = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=0.1,
+        stream=False,
+        response_format={"type": "json_object"},
+    )
+
+    content = response.choices[0].message.content
+
+    if not content:
+        raise ValueError("模型没有返回工具决策 JSON。")
+
+    return json.loads(content)
+
+def execute_tool_call(tool_decision: dict[str, Any]) -> dict[str, Any]:
+    """根据模型输出的 tool_call JSON 执行对应工具。"""
+
+    need_tool = tool_decision.get("need_tool", False)
+
+    if not need_tool:
+        return {
+            "used_tool": False,
+            "tool_name": None,
+            "arguments": {},
+            "result": None,
+            "error": None,
+        }
+
+    tool_name = tool_decision.get("tool_name")
+    arguments = tool_decision.get("arguments", {})
+
+    if tool_name != "calculator":
+        return {
+            "used_tool": False,
+            "tool_name": tool_name,
+            "arguments": arguments,
+            "result": None,
+            "error": f"未知工具：{tool_name}",
+        }
+
+    expression = arguments.get("expression")
+
+    if not expression:
+        return {
+            "used_tool": False,
+            "tool_name": tool_name,
+            "arguments": arguments,
+            "result": None,
+            "error": "calculator 缺少 expression 参数。",
+        }
+
+    try:
+        result = calculator_tool(expression)
+
+        return {
+            "used_tool": True,
+            "tool_name": tool_name,
+            "arguments": arguments,
+            "result": result,
+            "error": None,
+        }
+
+    except Exception as error:
+        return {
+            "used_tool": False,
+            "tool_name": tool_name,
+            "arguments": arguments,
+            "result": None,
+            "error": str(error),
+        }
+
+def build_tool_answer_messages(
+    history: list[dict],
+    user_input: str,
+    tool_decision: dict[str, Any],
+    tool_result: dict[str, Any],
+) -> list[dict]:
+    """把工具执行结果重新组织成 messages，让模型生成最终回答。"""
+
+    messages = [
+        {
+            "role": "system",
+            "content": SYSTEM_PROMPT,
+        }
+    ]
+
+    # 最终回答时也只带最近历史
+    recent_history = history[-MAX_CONTEXT_MESSAGES:]
+    messages.extend(recent_history)
+
+    # 用户原始问题
+    messages.append(
+        {
+            "role": "user",
+            "content": user_input,
+        }
+    )
+
+    # 把工具决策和工具执行结果作为上下文交给模型
+    messages.append(
+        {
+            "role": "user",
+            "content": (
+                "下面是程序已经执行完成的工具调用结果。\n"
+                "请你基于工具结果回答用户，不要编造额外计算结果。\n\n"
+                f"工具决策 JSON：\n{json.dumps(tool_decision, ensure_ascii=False, indent=2)}\n\n"
+                f"工具执行结果 JSON：\n{json.dumps(tool_result, ensure_ascii=False, indent=2)}"
+            ),
+        }
+    )
+
+    return messages
 
 def show_json_result(result: dict[str, Any]) -> None:
     """在终端中格式化显示 JSON 结果。"""
@@ -261,6 +497,7 @@ def show_help() -> None:
             "/history              查看当前完整对话历史\n"
             "/clear                清空当前对话历史\n"
             "/json <text>          将文本转换为结构化 JSON\n"
+            "/tools                查看当前可用工具\n"
             "/help                 查看命令说明\n"
             "exit                  退出程序\n"
             "quit                  退出程序",
@@ -268,6 +505,15 @@ def show_help() -> None:
         )
     )
 
+def show_tools() -> None:
+    """显示当前 MiniAgent 可用的工具。"""
+
+    console.print(
+        Panel.fit(
+            "calculator: 计算基础数学表达式，例如 23 * 45、(12 + 8) / 4",
+            title="Available Tools",
+        )
+    )
 
 def main() -> None:
     """MiniAgent 主程序入口。"""
@@ -284,7 +530,7 @@ def main() -> None:
     # 4. 打印启动信息
     console.print(
         Panel.fit(
-            f"MiniAgent v0.4\n"
+            f"MiniAgent v0.5\n"
             f"Provider: {config['provider']}\n"
             f"Model: {config['model']}\n"
             f"History messages: {len(history)}\n"
@@ -313,6 +559,10 @@ def main() -> None:
         # /help 是程序命令，不发送给模型
         if user_input == "/help":
             show_help()
+            continue
+        
+        if user_input == "/tools":
+            show_tools()
             continue
 
         # /history 是程序命令，用于查看完整本地历史
@@ -350,17 +600,83 @@ def main() -> None:
             # /json 是工具命令，不进入普通聊天流程
             continue
 
+        if user_input.startswith("/calc "):
+            expression = user_input.removeprefix("/calc ").strip()
+
+            if not expression:
+                console.print("[yellow]请在 /calc 后面输入数学表达式。[/yellow]")
+                continue
+
+            try:
+                result = calculator_tool(expression)
+                console.print(f"[bold green]Calculator Result:[/bold green] {result}")
+            except Exception as error:
+                console.print(f"[bold red]Calculator failed:[/bold red] {error}")
+
+            continue
+
         # 普通聊天流程：
         # 1. 构造本次 messages
         # 2. 调用模型并流式输出
         # 3. 把 user 和 assistant 保存到 history.json
-        messages = build_messages(history, user_input)
+        
+        try:
+            # 第一步：让模型判断是否需要调用工具
+            tool_decision = ask_tool_decision(
+                client=client,
+                model=config["model"],
+                history=history,
+                user_input=user_input,
+            )
 
-        answer = ask_llm_stream(
-            client=client,
-            model=config["model"],
-            messages=messages,
-        )
+            # 第二步：如果模型认为需要工具，就由 Python 执行工具
+            tool_result = execute_tool_call(tool_decision)
+
+            # 第三步：如果工具成功执行，把工具结果交回模型生成最终回答
+            if tool_result["used_tool"]:
+                console.print(
+                    f"\n[bold blue]Tool Call:[/bold blue] "
+                    f"{tool_result['tool_name']}({tool_result['arguments']})"
+                )
+                console.print(f"[bold blue]Tool Result:[/bold blue] {tool_result['result']}")
+
+                messages = build_tool_answer_messages(
+                    history=history,
+                    user_input=user_input,
+                    tool_decision=tool_decision,
+                    tool_result=tool_result,
+                )
+
+                answer = ask_llm_stream(
+                    client=client,
+                    model=config["model"],
+                    messages=messages,
+                )
+
+            # 第四步：如果不需要工具，就走普通聊天流程
+            else:
+                if tool_result["error"]:
+                    console.print(f"[yellow]Tool skipped:[/yellow] {tool_result['error']}")
+
+                messages = build_messages(history, user_input)
+
+                answer = ask_llm_stream(
+                    client=client,
+                    model=config["model"],
+                    messages=messages,
+                )
+
+        except Exception as error:
+            console.print(f"[bold red]Tool calling failed:[/bold red] {error}")
+
+            # 如果工具判断流程失败，就退回普通聊天
+            messages = build_messages(history, user_input)
+
+            answer = ask_llm_stream(
+                client=client,
+                model=config["model"],
+                messages=messages,
+            )
 
         # 保存用户这一轮输入
         history.append(
