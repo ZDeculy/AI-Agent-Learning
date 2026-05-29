@@ -78,3 +78,9 @@ data/raw/
 data/private/
 private/
 secrets/
+
+
+# =========================================================
+# history json
+# 这个文件用来记录对话历史，可能包含敏感信息，不需要提交。
+history.json
