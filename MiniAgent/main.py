@@ -97,6 +97,76 @@ def calculator_tool(expression: str) -> str:
 
     return str(result)
 
+def word_count_tool(text: str) -> dict[str, int]:
+    """word_count 工具：统计文本长度信息。"""
+
+    # 总字符数：包括空格、标点、中文、英文
+    total_chars = len(text)
+
+    # 去掉空格后的字符数
+    chars_without_spaces = len(text.replace(" ", ""))
+
+    # 中文字符数：粗略判断 Unicode 范围
+    chinese_chars = sum(1 for char in text if "\u4e00" <= char <= "\u9fff")
+
+    # 英文单词数：简单按空格切分，只统计纯英文片段
+    english_words = len(
+        [
+            word
+            for word in text.split()
+            if word.replace("-", "").replace("_", "").isalpha()
+        ]
+    )
+
+    return {
+        "total_chars": total_chars,
+        "chars_without_spaces": chars_without_spaces,
+        "chinese_chars": chinese_chars,
+        "english_words": english_words,
+    }
+
+# 工具注册表：集中管理当前 Agent 能使用的所有工具
+# name：模型需要输出的 tool_name
+# description：告诉模型这个工具能做什么
+# arguments：告诉模型调用工具时需要传什么参数
+# function：Python 实际执行的函数
+TOOL_REGISTRY = {
+    "calculator": {
+        "description": "计算基础数学表达式，例如 23 * 45、(12 + 8) / 4。",
+        "arguments": {
+            "expression": "要计算的数学表达式，例如 23 * 45",
+        },
+        "function": calculator_tool,
+    },
+    "word_count": {
+        "description": "统计文本的总字符数、去空格字符数、中文字符数和英文单词数。",
+        "arguments": {
+            "text": "要统计的文本内容",
+        },
+        "function": word_count_tool,
+    },
+}
+
+def build_tool_descriptions() -> str:
+    """根据 TOOL_REGISTRY 自动生成工具说明文本。"""
+
+    descriptions = []
+
+    for tool_name, tool_info in TOOL_REGISTRY.items():
+        arguments = tool_info["arguments"]
+
+        argument_lines = []
+        for arg_name, arg_description in arguments.items():
+            argument_lines.append(f"    - {arg_name}: {arg_description}")
+
+        descriptions.append(
+            f"- {tool_name}: {tool_info['description']}\n"
+            f"  参数:\n"
+            f"{chr(10).join(argument_lines)}"
+        )
+
+    return "\n".join(descriptions)
+
 def load_config() -> dict:
     """从 .env 文件中读取 LLM 配置。"""
 
@@ -293,14 +363,16 @@ def ask_tool_decision(
     # 只带最近历史，避免完整 history 干扰工具判断
     recent_history = history[-MAX_CONTEXT_MESSAGES:]
 
+    # 自动从 TOOL_REGISTRY 生成工具说明
+    tool_descriptions = build_tool_descriptions()
+
     messages = [
         {
             "role": "system",
             "content": (
                 "你是一个工具调用决策器。"
                 "你的任务是判断用户问题是否需要调用工具。"
-                "当前可用工具只有一个：calculator。"
-                "calculator 用于计算基础数学表达式，例如 23 * 45、(12 + 8) / 4。"
+                "如果需要工具，你必须从可用工具列表中选择一个。"
                 "你必须只输出合法 JSON，不要输出 Markdown，不要输出解释。"
                 "JSON 必须包含字段：need_tool、tool_name、arguments、reason。"
             ),
@@ -314,13 +386,15 @@ def ask_tool_decision(
         {
             "role": "user",
             "content": (
+                "当前可用工具如下：\n\n"
+                f"{tool_descriptions}\n\n"
                 "请判断下面这个用户输入是否需要调用工具。\n\n"
                 f"用户输入：{user_input}\n\n"
-                "如果需要计算，请输出：\n"
+                "如果需要工具，请输出：\n"
                 "{\n"
                 '  "need_tool": true,\n'
-                '  "tool_name": "calculator",\n'
-                '  "arguments": {"expression": "数学表达式"},\n'
+                '  "tool_name": "工具名称",\n'
+                '  "arguments": {"参数名": "参数值"},\n'
                 '  "reason": "为什么需要调用工具"\n'
                 "}\n\n"
                 "如果不需要工具，请输出：\n"
@@ -329,7 +403,11 @@ def ask_tool_decision(
                 '  "tool_name": null,\n'
                 '  "arguments": {},\n'
                 '  "reason": "为什么不需要调用工具"\n'
-                "}"
+                "}\n\n"
+                "注意：\n"
+                "1. tool_name 必须来自可用工具列表。\n"
+                "2. calculator 的参数必须是 expression。\n"
+                "3. word_count 的参数必须是 text。\n"
             ),
         }
     )
@@ -366,7 +444,8 @@ def execute_tool_call(tool_decision: dict[str, Any]) -> dict[str, Any]:
     tool_name = tool_decision.get("tool_name")
     arguments = tool_decision.get("arguments", {})
 
-    if tool_name != "calculator":
+    # 检查模型选择的工具是否在注册表里
+    if tool_name not in TOOL_REGISTRY:
         return {
             "used_tool": False,
             "tool_name": tool_name,
@@ -375,19 +454,26 @@ def execute_tool_call(tool_decision: dict[str, Any]) -> dict[str, Any]:
             "error": f"未知工具：{tool_name}",
         }
 
-    expression = arguments.get("expression")
-
-    if not expression:
+    # arguments 必须是字典，否则无法作为函数参数传入
+    if not isinstance(arguments, dict):
         return {
             "used_tool": False,
             "tool_name": tool_name,
             "arguments": arguments,
             "result": None,
-            "error": "calculator 缺少 expression 参数。",
+            "error": "工具参数 arguments 必须是 JSON object。",
         }
 
+    tool_info = TOOL_REGISTRY[tool_name]
+    tool_function = tool_info["function"]
+
     try:
-        result = calculator_tool(expression)
+        # **arguments 会把 JSON 参数展开成 Python 函数参数
+        # 例如：
+        # calculator_tool(**{"expression": "23 * 45"})
+        # 等价于：
+        # calculator_tool(expression="23 * 45")
+        result = tool_function(**arguments)
 
         return {
             "used_tool": True,
@@ -405,7 +491,7 @@ def execute_tool_call(tool_decision: dict[str, Any]) -> dict[str, Any]:
             "result": None,
             "error": str(error),
         }
-
+    
 def build_tool_answer_messages(
     history: list[dict],
     user_input: str,
@@ -498,6 +584,8 @@ def show_help() -> None:
             "/clear                清空当前对话历史\n"
             "/json <text>          将文本转换为结构化 JSON\n"
             "/tools                查看当前可用工具\n"
+            "/calc <expr>          手动调用 calculator 工具\n"
+            "/wordcount <text>     手动调用 word_count 工具\n"
             "/help                 查看命令说明\n"
             "exit                  退出程序\n"
             "quit                  退出程序",
@@ -510,7 +598,7 @@ def show_tools() -> None:
 
     console.print(
         Panel.fit(
-            "calculator: 计算基础数学表达式，例如 23 * 45、(12 + 8) / 4",
+            build_tool_descriptions(),
             title="Available Tools",
         )
     )
@@ -530,7 +618,7 @@ def main() -> None:
     # 4. 打印启动信息
     console.print(
         Panel.fit(
-            f"MiniAgent v0.5\n"
+            f"MiniAgent v0.6\n"
             f"Provider: {config['provider']}\n"
             f"Model: {config['model']}\n"
             f"History messages: {len(history)}\n"
@@ -612,6 +700,20 @@ def main() -> None:
                 console.print(f"[bold green]Calculator Result:[/bold green] {result}")
             except Exception as error:
                 console.print(f"[bold red]Calculator failed:[/bold red] {error}")
+
+            continue
+        
+        if user_input.startswith("/wordcount "):
+            text = user_input.removeprefix("/wordcount ").strip()
+
+            if not text:
+                console.print("[yellow]请在 /wordcount 后面输入要统计的文本。[/yellow]")
+                continue
+
+            result = word_count_tool(text)
+
+            console.print("[bold green]Word Count Result:[/bold green]")
+            console.print_json(json.dumps(result, ensure_ascii=False))
 
             continue
 
